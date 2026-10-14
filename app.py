@@ -29,6 +29,13 @@ from pypdf import PdfReader
 # Model IDs change often. Override with the GEMINI_MODEL env var / secret, or
 # type a different one in the sidebar, without touching the code.
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# Tried in order if the chosen model is overloaded (503), rate-limited or unavailable.
+# Override with a comma-separated GEMINI_FALLBACK_MODELS env var / secret.
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash,gemini-2.5-flash").split(",")
+    if m.strip()
+]
 
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
@@ -391,31 +398,46 @@ def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_descript
     except Exception as exc:
         raise AnalysisError(f"Could not initialise the Gemini client: {exc}") from exc
 
+    models_to_try = list(dict.fromkeys([model, *FALLBACK_MODELS]))  # de-duplicated, order kept
     last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(model=model, contents=prompt, config=config)
-            return normalize_analysis(parse_json(response.text))
-        except (json.JSONDecodeError, ValueError) as exc:
-            last_error = exc  # malformed output: just try again
-        except Exception as exc:  # API / network errors
-            last_error = exc
-            msg = str(exc).lower()
-            if any(k in msg for k in ("api key", "api_key", "permission", "401", "403", "unauthenticated")):
-                raise AnalysisError("Your Gemini API key was rejected. Please check it and try again.") from exc
-            if "404" in msg or "not found" in msg:
-                raise AnalysisError(
-                    f"Model '{model}' was not found. Change the model name in the sidebar."
-                ) from exc
-            if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-                if attempt == 2:
-                    raise AnalysisError(
-                        "Gemini rate limit / quota reached. Wait a minute and try again."
-                    ) from exc
-        if attempt < 2:
-            time.sleep(1.5 * (attempt + 1))
+    skipped: list[str] = []
 
-    raise AnalysisError(f"The AI analysis failed after 3 attempts. Last error: {last_error}")
+    for current in models_to_try:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(model=current, contents=prompt, config=config)
+                analysis = normalize_analysis(parse_json(response.text))
+                analysis["model_used"] = current
+                return analysis
+            except (json.JSONDecodeError, ValueError) as exc:
+                last_error = exc  # malformed output: retry the same model
+            except Exception as exc:  # API / network errors
+                last_error = exc
+                msg = str(exc).lower()
+                if any(k in msg for k in ("api key", "api_key", "permission", "401", "403", "unauthenticated")):
+                    raise AnalysisError("Your Gemini API key was rejected. Please check it and try again.") from exc
+                if "404" in msg or "not found" in msg:
+                    skipped.append(current)
+                    break  # this model ID doesn't exist: go straight to the next one
+                if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+                    break  # quota is per model: don't hammer it, try the next model
+                # 500/502/503/504, overloaded, timeouts, etc.: retry with exponential backoff
+            if attempt < 2:
+                time.sleep(2 * (2**attempt))  # 2s, then 4s
+
+    if skipped and len(skipped) == len(models_to_try):
+        raise AnalysisError(
+            f"None of the models were found ({', '.join(skipped)}). Check the model name in the sidebar."
+        )
+    msg = str(last_error).lower()
+    if "503" in msg or "unavailable" in msg or "high demand" in msg:
+        raise AnalysisError(
+            "Gemini is overloaded right now (Google-side, usually temporary). "
+            f"I tried: {', '.join(models_to_try)}. Please wait a minute and click Analyze again."
+        )
+    if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+        raise AnalysisError("Gemini rate limit / quota reached on all models. Wait a minute and try again.")
+    raise AnalysisError(f"The AI analysis failed. Last error: {last_error}")
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +471,7 @@ def build_report(result: dict) -> str:
         "",
         f"**Estimated ATS score: {result['final_score']}/100 ({label})**",
         f"**Target role:** {analysis['detected_role'] or 'N/A'}",
+        f"**Model:** {analysis.get('model_used', 'n/a')}",
         "",
         analysis["summary"],
         "",
@@ -505,6 +528,8 @@ def render_results(result: dict) -> None:
     with right:
         st.markdown(f"**Target role detected:** {analysis['detected_role'] or 'N/A'}")
         st.write(analysis["summary"])
+        if analysis.get("model_used"):
+            st.caption(f"Analysed with {analysis['model_used']}")
 
     st.divider()
     columns = st.columns(len(CATEGORY_TITLES))
