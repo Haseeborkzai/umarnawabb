@@ -46,6 +46,8 @@ The default is `gemini-3.6-flash`. Google releases new Flash versions often, so 
 - type a different model ID in the sidebar, or
 - set the `GEMINI_MODEL` environment variable / Streamlit secret.
 
+**Automatic fallback:** if the chosen model is overloaded (HTTP 503), rate-limited, or doesn't exist, the app retries with backoff and then tries `gemini-3.5-flash` and `gemini-2.5-flash`. Override this with a comma-separated `GEMINI_FALLBACK_MODELS` environment variable / Streamlit secret.
+
 If you see a "model not found" error, the ID was retired or renamed — check https://ai.google.dev/gemini-api/docs/models for the current list.
 
 ## Deploy on Streamlit Community Cloud
